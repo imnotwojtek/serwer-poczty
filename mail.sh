@@ -1,109 +1,185 @@
 #!/bin/bash
 
-# Check for root privileges
+# Sprawdzenie uprawnień root
 if [ "$(id -u)" != "0" ]; then
-    echo "Run this script as root!"
+    echo "Uruchom skrypt jako root!"
     exit 1
 fi
 
-# Update system and install packages
-apt update && apt upgrade -y
-apt install -y postfix dovecot-core dovecot-imapd dovecot-pop3d \
-opendkim opendkim-tools opendmarc rspamd clamav-daemon fail2ban \
-certbot ufw redis-server unattended-upgrades logwatch mysql-server \
-auditd && apt autoremove -y
+# Zmienna dla domeny
+DOMAIN="wojtek.ovh"
+EMAIL="admin@$DOMAIN"
+DOCKER_COMPOSE_VERSION="1.29.2"
 
-# Automatic updates configuration
-dpkg-reconfigure -plow unattended-upgrades
+# Instalacja Dockera i Docker Compose
+echo "Instalacja Dockera i Docker Compose..."
+apt update && apt install -y \
+    apt-transport-https ca-certificates curl software-properties-common \
+    lsb-release sudo
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/docker.gpg
+echo "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io
 
-# Firewall (UFW) - Stricter rules
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow 25,587,465/tcp  # SMTP
-ufw allow 143,993,110,995/tcp  # IMAP/POP3
-ufw allow 3306/tcp  # MySQL (only if needed)
-ufw enable
+# Instalacja Docker Compose
+echo "Instalacja Docker Compose..."
+curl -L "https://github.com/docker/compose/releases/download/$DOCKER_COMPOSE_VERSION/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+chmod +x /usr/local/bin/docker-compose
 
-# Postfix: Enhanced Security
-postconf -e "myhostname = mail.yourdomain.com" # Replace yourdomain.com
-postconf -e "mydomain = yourdomain.com" # Replace yourdomain.com
-postconf -e "myorigin = $mydomain"
-postconf -e "mydestination = $myhostname, $mydomain, localhost.localdomain, localhost"
-postconf -e "relayhost ="
-postconf -e "smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"
-postconf -e "smtpd_tls_mandatory_protocols = TLSv1.2, TLSv1.3"
-postconf -e "smtpd_tls_mandatory_ciphers = HIGH"
-postconf -e "smtpd_tls_security_level = encrypt"
-postconf -e "smtpd_relay_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination"
-postconf -e "smtpd_recipient_restrictions = permit_mynetworks, reject_unauth_destination, check_policy_service unix:private/policy-spf"
-postconf -e "smtpd_data_restrictions = reject_unauth_destination" # added stricter check
-postconf -e "smtpd_banner = $myhostname ESMTP $mail_name (Ubuntu)" # Minimal banner
-postconf -e "disable_vrfy_command = yes" # Security best practice
-postconf -e "smtp_helo_timeout = 300s"
-postconf -e "smtpd_helo_required = yes"
+# Dodanie użytkownika do grupy Docker
+usermod -aG docker $USER
 
+# Instalacja wymaganych kontenerów
+echo "Pobieranie i uruchamianie kontenerów..."
+mkdir -p /home/$USER/mailserver
+cd /home/$USER/mailserver
 
-# Dovecot: High Security
-sed -i 's/#ssl = yes/ssl = yes/' /etc/dovecot/conf.d/10-ssl.conf
-sed -i 's/#auth_mechanisms = plain login/auth_mechanisms = plain login/' /etc/dovecot/conf.d/10-auth.conf
-sed -i 's/#disable_plaintext_auth = yes/disable_plaintext_auth = yes/' /etc/dovecot/conf.d/10-auth.conf
-# Consider using a more secure authentication method like LDAP or PAM
+# Tworzymy plik docker-compose.yml
+cat > docker-compose.yml <<EOL
+version: '3'
 
-# DKIM and DMARC configuration (Generate your own keys)
-# ... (Your DKIM and DMARC key generation and configuration) ...  # DO NOT USE GENERATED KEYS DIRECTLY FROM SCRIPT!
+services:
+  postfix:
+    image: instrumentisto/postfix
+    container_name: postfix
+    environment:
+      - MAIL_DOMAIN=$DOMAIN
+      - MAIL_RELAY_HOST=mail.$DOMAIN
+      - SMTP_PORT=587
+    ports:
+      - "587:587"
+    networks:
+      - mailnet
+    volumes:
+      - ./postfix/config:/etc/postfix
+      - ./postfix/mail:/var/mail
+    restart: always
 
-# Let's Encrypt - Automatic renewal
-(crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet --post-hook 'systemctl reload postfix dovecot'") | crontab -
+  dovecot:
+    image: dovecot/dovecot
+    container_name: dovecot
+    environment:
+      - MAIL_DOMAIN=$DOMAIN
+    ports:
+      - "993:993"
+      - "143:143"
+    volumes:
+      - ./dovecot/config:/etc/dovecot
+      - ./dovecot/mail:/var/mail
+    networks:
+      - mailnet
+    restart: always
 
-# Fail2Ban: Enhanced Security
-cat > /etc/fail2ban/jail.local <<EOL
-[postfix]
-enabled  = true
-port    = smtp,ssmtp
-logpath = /var/log/mail.log
-maxretry = 3
-bantime  = 86400
+  opendkim:
+    image: instrumentisto/opendkim
+    container_name: opendkim
+    environment:
+      - MAIL_DOMAIN=$DOMAIN
+    volumes:
+      - ./opendkim/config:/etc/opendkim
+    networks:
+      - mailnet
+    restart: always
 
-[dovecot]
-enabled  = true
-port    = pop3,pop3s,imap,imaps
-logpath = /var/log/mail.log
-maxretry = 3
-bantime  = 86400
+  rspamd:
+    image: rspamd/rspamd
+    container_name: rspamd
+    ports:
+      - "11332:11332"
+    networks:
+      - mailnet
+    volumes:
+      - ./rspamd/config:/etc/rspamd
+    restart: always
 
-[mysqld-auth]
-enabled  = true
-port    = 3306
-logpath = /var/log/mysql/error.log
-maxretry = 3
-bantime  = 86400
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    ports:
+      - "3000:3000"
+    networks:
+      - mailnet
+    restart: always
+
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - mailnet
+    volumes:
+      - ./prometheus/config:/etc/prometheus
+      - ./prometheus/data:/prometheus
+    restart: always
+
+  fail2ban:
+    image: crazymax/fail2ban
+    container_name: fail2ban
+    environment:
+      - TZ=Europe/Warsaw
+    volumes:
+      - ./fail2ban/config:/etc/fail2ban
+    networks:
+      - mailnet
+    restart: always
+
+  clamav:
+    image: clamav/clamav
+    container_name: clamav
+    ports:
+      - "3310:3310"
+    networks:
+      - mailnet
+    restart: always
+
+  redis:
+    image: redis
+    container_name: redis
+    networks:
+      - mailnet
+    restart: always
+
+  cockpit:
+    image: cockpit-project/cockpit
+    container_name: cockpit
+    ports:
+      - "9090:9090"
+    networks:
+      - mailnet
+    restart: always
+
+networks:
+  mailnet:
+    driver: bridge
 EOL
-systemctl restart fail2ban
 
-# Rspamd (Spam filtering) - Minimal Configuration
-systemctl enable rspamd
-systemctl start rspamd
+# Wybór ścieżek do plików konfiguracji
+echo "Tworzenie katalogów do konfiguracji..."
+mkdir -p ./postfix/config ./postfix/mail ./dovecot/config ./dovecot/mail ./opendkim/config ./rspamd/config ./prometheus/config ./prometheus/data ./fail2ban/config ./clamav/config ./cockpit/config
 
-# ClamAV (Antivirus) - Minimal Configuration
-freshclam
-systemctl enable clamav-daemon
-systemctl start clamav-daemon
+# Konfiguracja SSL (Certbot)
+echo "Tworzenie certyfikatów SSL..."
+docker run --rm -v /home/$USER/mailserver/certbot/config:/etc/letsencrypt -v /home/$USER/mailserver/certbot/www:/var/www/certbot \
+    certbot/certbot certonly --standalone -d $DOMAIN -d mail.$DOMAIN --non-interactive --agree-tos -m $EMAIL
 
-# MySQL: Security hardening (Replace with stronger password!)
-mysql_secure_installation
-# Consider using TLS for MySQL connections
+# Uruchomienie kontenerów
+echo "Uruchamianie kontenerów Docker..."
+docker-compose up -d
 
+# Konfiguracja automatycznych backupów
+echo "Konfiguracja automatycznych backupów..."
+echo "0 3 * * * root tar -czf /home/$USER/mailserver/backups/mailserver_$(date +\%F).tar.gz /home/$USER/mailserver" >> /etc/crontab
 
-# Logwatch: Minimal configuration.  No email addresses!
-echo "Detail = High" > /etc/logwatch/conf/logwatch.conf
-systemctl restart logwatch
+# Monitoring i logi
+echo "Konfiguracja monitorowania i logowania..."
+docker exec grafana /bin/bash -c "grafana-cli plugins install grafana-piechart-panel"
+docker exec prometheus /bin/bash -c "prometheus --config.file=/etc/prometheus/prometheus.yml --web.listen-address=:9090"
 
-# Auditd: System Auditing (Customize rules as needed)
-systemctl enable auditd
-systemctl start auditd
-# Add audit rules to /etc/audit/audit.rules to monitor specific files and actions.
+# Restart usług
+echo "Restart usług..."
+docker-compose restart
 
-# Restart services
-systemctl restart postfix dovecot rspamd clamav-daemon
-
-echo "Installation complete!  Security and Privacy Enhanced."
+echo "Instalacja zakończona! Serwer pocztowy skonfigurowany w Dockerze dla $DOMAIN. Usługi są dostępne w kontenerach Docker."
